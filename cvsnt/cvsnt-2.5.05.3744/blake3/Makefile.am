@@ -14,7 +14,8 @@ else
 AM_CFLAGS = -msse4.1
 libblake3_la_SOURCES += blake3_avx2_x86-64_unix.S blake3_sse2_x86-64_unix.S blake3_sse41_x86-64_unix.S
 if BUILD_AVX512
-AM_CFLAGS += -mavx -mavx2 -mavx512f
+# note: no -mavx512f here - the avx512 kernel is pre-written assembly picked at
+# runtime via cpuid; allowing avx512 codegen in the C sources crashes older CPUs
 libblake3_la_SOURCES += blake3_avx512_x86-64_unix.S
 else
 AM_CFLAGS += -DBLAKE3_NO_AVX512=1
