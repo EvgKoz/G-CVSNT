@@ -8,6 +8,9 @@
 #include "concurrent_queue.h"
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <chrono>
+#include <cstring>
 #include "blob_network_processor.h"
 #include "../ca_blobs_fs/streaming_blobs.h"
 
@@ -37,6 +40,122 @@ static bool process_blob_task(BlobNetworkProcessor *download_processor, BlobNetw
 static std::atomic<int> hasErrors;
 extern void cvs_flusherr();
 
+int blob_download_progress = 0;//--blob_progress: once a second print download speed & servers data comes from
+
+enum {MAX_PROGRESS_CLIENTS = 64};
+static std::atomic<uint64_t> progress_bytes{0};//total wire bytes downloaded
+static std::atomic<uint64_t> progress_client_bytes[MAX_PROGRESS_CLIENTS];
+static std::atomic<bool> progress_stop{false};
+static std::thread progress_thread;
+static std::mutex progress_mutex;//guards urls & console line state
+static std::string progress_client_url[MAX_PROGRESS_CLIENTS];//url:port each download client is connected to
+static size_t progress_line_len = 0;//chars of progress line currently on screen
+
+void blob_progress_note_server(int id, const char *url, int port)
+{
+  if (!blob_download_progress || unsigned(id) >= MAX_PROGRESS_CLIENTS)
+    return;
+  char buf[300]; std::snprintf(buf, sizeof(buf), "%s:%d", url, port);
+  std::lock_guard<std::mutex> lock(progress_mutex);
+  progress_client_url[id] = buf;
+}
+
+void blob_progress_add_bytes(int id, uint64_t sz)
+{
+  if (!blob_download_progress)
+    return;
+  progress_bytes.fetch_add(sz, std::memory_order_relaxed);
+  if (unsigned(id) < MAX_PROGRESS_CLIENTS)
+    progress_client_bytes[id].fetch_add(sz, std::memory_order_relaxed);
+}
+
+static void progress_clear_line_unlocked()
+{
+  if (progress_line_len)
+  {
+    fprintf(stderr, "\r%*s\r", (int)progress_line_len, "");
+    fflush(stderr);
+    progress_line_len = 0;
+  }
+}
+
+//erase the progress line so regular output starts at column 0. call before printing to the console
+void blob_progress_clear_line()
+{
+  if (!blob_download_progress)
+    return;
+  std::lock_guard<std::mutex> lock(progress_mutex);
+  progress_clear_line_unlocked();
+}
+
+static void progress_loop()
+{
+  const double MB = 1024.*1024.;
+  uint64_t prev = 0, prevClient[MAX_PROGRESS_CLIENTS] = {0};
+  bool printedAnything = false;
+  auto tick = std::chrono::steady_clock::now();
+  for (;;)
+  {
+    tick += std::chrono::seconds(1);
+    while (!progress_stop.load() && std::chrono::steady_clock::now() < tick)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (progress_stop.load())
+      break;
+    const uint64_t cur = progress_bytes.load();
+    const uint64_t spd = cur - prev;
+    prev = cur;
+    if (!cur)
+      continue;//nothing downloaded yet, keep quiet
+    //the source to show is where the bytes of the last second actually came from
+    int best = -1, active = 0; uint64_t bestSpd = 0;
+    for (int i = 0; i < MAX_PROGRESS_CLIENTS; ++i)
+    {
+      const uint64_t cb = progress_client_bytes[i].load(std::memory_order_relaxed), d = cb - prevClient[i];
+      prevClient[i] = cb;
+      if (!d)
+        continue;
+      ++active;
+      if (d > bestSpd) { bestSpd = d; best = i; }
+    }
+    char line[512], more[32] = "";
+    if (active > 1)
+      std::snprintf(more, sizeof(more), " +%d more", active-1);
+    std::lock_guard<std::mutex> lock(progress_mutex);
+    std::snprintf(line, sizeof(line), "%.2f MB/s from %s%s (%.1f MB total)",
+      spd/MB, best < 0 ? "-" : progress_client_url[best].c_str(), more, cur/MB);
+    const size_t len = strlen(line);
+    fprintf(stderr, "\r%-*s", (int)(len > progress_line_len ? len : progress_line_len), line);
+    fflush(stderr);
+    progress_line_len = len;
+    printedAnything = true;
+  }
+  std::lock_guard<std::mutex> lock(progress_mutex);
+  if (progress_line_len)
+  {
+    fputs("\n", stderr);
+    fflush(stderr);
+    progress_line_len = 0;
+  }
+  else if (printedAnything)
+    fflush(stderr);
+}
+
+static void start_progress_thread()
+{
+  if (!blob_download_progress || progress_thread.joinable())
+    return;
+  progress_stop = false;
+  progress_thread = std::thread(progress_loop);
+}
+
+static void stop_progress_thread()
+{
+  if (!progress_thread.joinable())
+    return;
+  progress_stop = true;
+  progress_thread.join();
+}
+
 template <typename T>
 struct atomic_wrapper
 {
@@ -63,16 +182,19 @@ struct BackgroundProcessor:public UrlProvider
   BackgroundProcessor():queue(&threads){}
   ~BackgroundProcessor()
   {
+    stop_progress_thread();
   }
   void finishDownloads()
   {
     if (hasErrors.load())
     {
       queue.cancel();
+      stop_progress_thread();
       cvs_flusherr();
       error_exit();
     }
     queue.finishWork();
+    stop_progress_thread();
   }
 
   bool is_inited() const {return !download_clients.empty();}
@@ -176,6 +298,7 @@ void BackgroundProcessor::fail(int attempt, int id) const
   const int ui = roundRobin.shuffle(attempt, id);
   if (roundRobin.urls[ui].failed)//already failed
     return;
+  blob_progress_clear_line();
   error(0,0, "Blobs server %s:%d failed\n%s. Contact IT!\n",
     roundRobin.urls[ui].url.c_str(), roundRobin.urls[ui].port,
     attempt < int(roundRobin.urls.size())-2 ? "Switching to next." :
@@ -296,6 +419,8 @@ void BackgroundProcessor::init()
 
   for (int ti = 0; ti < threads_count; ++ti)
     threads.emplace_back(std::thread(processor_thread_loop, this, download_clients[ti].get(), upload_clients[ti].get()));
+
+  start_progress_thread();
 }
 
 void BackgroundProcessor::wait()
@@ -322,6 +447,20 @@ void add_upload_queue(const char *filename, bool compress, const char *message)
 }
 int cvs_output(const char *, size_t);
 int cvs_outerr(const char *, size_t);
+//console output of worker threads has to erase the progress line first, so it starts at column 0;
+//the lock is held across the print so the ticker can't redraw the line in between
+static int out_msg(const char *buf)
+{
+  std::lock_guard<std::mutex> lock(progress_mutex);
+  progress_clear_line_unlocked();
+  return cvs_output(buf, 0);
+}
+static int err_msg(const char *buf)
+{
+  std::lock_guard<std::mutex> lock(progress_mutex);
+  progress_clear_line_unlocked();
+  return cvs_outerr(buf, 0);
+}
 
 #include <unordered_set>
 static std::unordered_set<std::string> download_dirs;
@@ -376,7 +515,7 @@ static bool download_blob_ref_file(BlobNetworkProcessor *processor, const BlobTa
     if (!tmp)
     {
       char buf[512]; std::snprintf(buf, sizeof(buf), "can't write temp %s\n", temp_filename.c_str());
-      cvs_outerr(buf, 0);
+      err_msg(buf);
       return false;
     }
     std::string err;
@@ -438,10 +577,13 @@ static bool download_blob_ref_file(BlobNetworkProcessor *processor, const BlobTa
       unlink_file(temp_filename.c_str());
       if (!processor->reconnect())
       {
-        cvs_outerr(buf, 0);
+        err_msg(buf);
         return false;
       } else
+      {
+        blob_progress_clear_line();
         error(0,0, "%s Reconnecting!\n", buf);
+      }
     }
     else
     {
@@ -464,12 +606,12 @@ static bool download_blob_ref_file(BlobNetworkProcessor *processor, const BlobTa
     {
       char buf[256];std::snprintf(buf, sizeof(buf),
         "ERROR: file <%s> has size of %lld after renaming, while we downloaded %lld\n", fullPath.c_str(), (long long)fsz, (long long)readUncompressedSz);
-      cvs_outerr(buf, 0);
+      err_msg(buf);
       return false;
     }
   }
   char buf[256];std::snprintf(buf, sizeof(buf),"u %s\n", task.message.c_str());
-  cvs_output(buf, 0);
+  out_msg(buf);
   return true;
 }
 bool is_blob_file_sent(const char* filepath, const char* fileopen, char* hash_encoded);
@@ -485,17 +627,17 @@ static bool upload_blob_ref_file(BlobNetworkProcessor *processor, const BlobTask
   if (!processor->upload(fullPath.c_str(), task.compress, hash, err))
   {
     char buf[512];std::snprintf(buf, sizeof(buf), "can't upload file <%s>, err = %s\n", fullPath.c_str(), err.c_str());
-    cvs_outerr(buf, 0);
+    err_msg(buf);
     return false;
   }
   if (finish_send_blob_file(task.filename.c_str(), fullPath.c_str(), hash))
   {
     char buf[256];std::snprintf(buf, sizeof(buf),"b %s\n", task.message.c_str());
-    cvs_output(buf, 0);
+    out_msg(buf);
   } else
   {
     char buf[512];std::snprintf(buf, sizeof(buf),"can't finish sending blob %s\n", task.message.c_str());
-    cvs_outerr(buf, 0);
+    err_msg(buf);
     return false;
   }
   return true;

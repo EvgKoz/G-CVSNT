@@ -347,6 +347,7 @@ static const char *const opt_usage[] =
 	"    -O              Disable client/server locale translation.\n",
 	"\n",
     "    --blob_url url   Blob download|upload url, each url can be in form of 127.0.0.1/something@80 (@80 - means port). 'def' means master. (examples: http://cvs-proxy.lan@8080 or localhost@2403|cvs-master.lan@2403)\n",
+    "    --blob_progress Once a second print current blob download speed and the server(s) data comes from.\n",
     "    --version       CVS version and copyright.\n",
     "    --encrypt       Encrypt all net traffic (if supported by protocol).\n",
     "    --authenticate  Authenticate all net traffic (if supported by protocol).\n",
@@ -759,6 +760,7 @@ int main (int argc, char **argv)
 		{"debug", 0, NULL, 9},
 #endif
     	{"blob_url", required_argument, NULL, 11},
+    	{"blob_progress", 0, NULL, 12},
         {0, 0, 0, 0}
     };
     /* `getopt_long' stores the option index here, but right now we
@@ -1015,6 +1017,9 @@ int main (int argc, char **argv)
 		break;
         case 11:
         strcpy(blob_cmd_download_url, optarg);
+		break;
+        case 12:
+        blob_download_progress = 1;
 		break;
 	    case 's':
 		variable_set (optarg);

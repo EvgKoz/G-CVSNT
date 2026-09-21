@@ -93,7 +93,11 @@ struct KVNetworkProcessor:public BlobNetworkProcessor
     CafsClientAuthentication auth = provider.demandAuth() ? CafsClientAuthentication::RequiresAuth : CafsClientAuthentication::AllowNoAuthPrivate;
     stop_blob_push_client(client);
     if (is_valid(client = start_blob_push_client(url.c_str(), port, provider.getRoot(), 2/*timeout*/, has_otp ? otp : nullptr, otp_page, auth)))
+    {
+      extern void blob_progress_note_server(int id, const char *url, int port);
+      blob_progress_note_server(id, url.c_str(), port);//ignores upload clients (id < 0)
       return true;
+    }
     provider.fail(attemptNo, id);
     return false;
   }
@@ -110,10 +114,14 @@ struct KVNetworkProcessor:public BlobNetworkProcessor
   {
     start();
     bool ok = true;
+    extern void blob_progress_add_bytes(int id, uint64_t sz);
     int64_t pulled = blob_pull_from_server(client, HASH_TYPE_REV_STRING, hex_hash, 0, 0, [&](const char *data, uint64_t , uint64_t size)
     {
        if (data && ok)//that's hint of size
+       {
+         blob_progress_add_bytes(id, size);
          ok = cb(data, size);
+       }
     });
     if (pulled == 0)
     {
