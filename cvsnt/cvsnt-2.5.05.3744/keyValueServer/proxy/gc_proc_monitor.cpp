@@ -1,6 +1,7 @@
 #include <string>
 #include <memory>
 #include <algorithm>
+#include <cstdint>
 #include <sys/types.h>
 #include <unistd.h>
 #include <signal.h>

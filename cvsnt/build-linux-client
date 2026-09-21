@@ -1,0 +1,68 @@
+#!/bin/bash
+# Build the CVS client (no server) for Linux.
+#
+# Usage:
+#   ./build-linux-client              # incremental: just make (fast, re-run per compile)
+#   ./build-linux-client --configure  # re-run autoreconf + configure, then make
+#   ./build-linux-client --clean      # make clean + full rebuild
+#
+# Build deps that modern distros no longer ship (autotools if absent, pcre1)
+# are downloaded and built once into .deps-linux/ — no sudo required.
+# Result is installed into dist-linux/ (client + protocol plugins):
+#   dist-linux/bin/cvs
+
+set -e
+cd "$(dirname "$0")"
+ROOT=$PWD
+SRC=$ROOT/cvsnt-2.5.05.3744
+DEPS=$ROOT/.deps-linux
+JOBS=$(nproc)
+
+export PATH="$DEPS/bin:$PATH"
+export PKG_CONFIG_PATH="$DEPS/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export ACLOCAL_PATH="$DEPS/share/aclocal:/usr/share/aclocal${ACLOCAL_PATH:+:$ACLOCAL_PATH}"
+
+fetch_build() { # name url [configure-args...]
+    local name=$1 url=$2; shift 2
+    local tar=$DEPS/src/${url##*/}
+    local dir=$DEPS/src/$name
+    echo "== one-time: building $name into $DEPS =="
+    mkdir -p "$DEPS/src"
+    [ -f "$tar" ] || curl -fL "$url" -o "$tar"
+    rm -rf "$dir"; mkdir -p "$dir"
+    tar -xf "$tar" -C "$dir" --strip-components=1
+    (cd "$dir" && ./configure --prefix="$DEPS" "$@" >build.log 2>&1 \
+        && make -j"$JOBS" >>build.log 2>&1 && make install >>build.log 2>&1) \
+        || { echo "FAILED, see $dir/build.log"; exit 1; }
+}
+
+command -v autoconf   >/dev/null || fetch_build autoconf https://ftp.gnu.org/gnu/autoconf/autoconf-2.72.tar.xz
+command -v automake   >/dev/null || fetch_build automake https://ftp.gnu.org/gnu/automake/automake-1.17.tar.xz
+command -v libtoolize >/dev/null || fetch_build libtool  https://ftp.gnu.org/gnu/libtool/libtool-2.5.4.tar.xz
+pkg-config --exists libpcre 2>/dev/null || \
+    fetch_build pcre https://ftp.exim.org/pub/pcre/pcre-8.45.tar.bz2 --enable-utf8 --enable-unicode-properties
+
+cd "$SRC"
+
+[ "$1" = "--clean" ] && [ -f Makefile ] && make clean
+
+if [ ! -f Makefile ] || [ "$1" = "--configure" ]; then
+    autoreconf -i -f
+    CFLAGS="${CFLAGS:--O2 -g -std=gnu11 -fcommon}" \
+    CXXFLAGS="${CXXFLAGS:--O2 -g -std=gnu++17}" \
+    bash configure \
+        --prefix="$ROOT/dist-linux" \
+        --disable-server \
+        --enable-pserver \
+        --enable-sspi \
+        --enable-ext \
+        --disable-mysql \
+        --disable-postgres \
+        --disable-sqlite \
+        --disable-pam \
+        --enable-64bit
+fi
+
+make -j"$JOBS"
+make install >/dev/null
+echo "OK: client installed at $ROOT/dist-linux/bin/cvs"

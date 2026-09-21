@@ -57,7 +57,7 @@ public:
 
 typedef plugin_interface* (*get_plugin_interface_t)();
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__linux__)
 #ifdef MODULE
 /* This needs an extra level of indirection.  gcc bug..? */
 #define __x11433a(__mod,__func) __mod##_LTX_##__func

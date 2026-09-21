@@ -190,6 +190,11 @@ CVSAPI_EXPORT char *wnt_ctime(const time_t *t);
 #define CVSNT_EXPORT
 #endif
 
+#ifdef __linux__
+/* Loaded directly with dlopen, no libtool .la indirection */
+#define SHARED_LIBRARY_EXTENSION ".so"
+#endif
+
 /* Default is to search for libtool (.la) extenstions - this should work on all platforms except win32 */
 #ifndef SHARED_LIBRARY_EXTENSION
 #define SHARED_LIBRARY_EXTENSION ".la"

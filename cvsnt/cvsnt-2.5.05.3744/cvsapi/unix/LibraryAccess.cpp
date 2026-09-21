@@ -23,7 +23,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
 #include <dlfcn.h>
 #include <string.h>
 

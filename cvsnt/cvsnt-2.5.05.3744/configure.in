@@ -761,7 +761,11 @@ AC_MSG_RESULT($acx_build_avx512)
 
 AC_MSG_CHECKING(mac build)
 AC_MSG_RESULT($acx_mac_build)
-AM_CONDITIONAL(WITH_LIBLTDL, test "x$acx_mac_build" != "xyes" )
+acx_use_ltdl="yes"
+case "$target_os" in
+  darwin* | linux* ) acx_use_ltdl="no" ;;
+esac
+AM_CONDITIONAL(WITH_LIBLTDL, test "x$acx_use_ltdl" = "xyes" )
 AM_CONDITIONAL(ALLOW_OPENMP, test "x$acx_mac_build" != "xyes" )
 AM_CONDITIONAL(ALLOW_LIBSTDC_FS, test "x$acx_mac_build" != "xyes" )
 AM_CONDITIONAL(WITH_SERVER_AND_TOOLS, test "x$acx_mac_build" != "xyes" )
@@ -989,32 +993,32 @@ test -f src/options.h && (
 
 AM_PROG_AS
 
-AC_CONFIG_FILES([Makefile \
-	  diff/Makefile \
-	  lib/Makefile \
-	  cvsgui/Makefile \
-	  cvsdelta/Makefile \
-	  man/Makefile \
-	  src/Makefile \
-	  protocols/Makefile \
-	  triggers/Makefile \
-	  lockservice/Makefile \
-	  rcs/Makefile \
-      blake3/Makefile \
-      ca_blobs_fs/Makefile \
-      keyValueServer/blob_sockets/Makefile \
-      keyValueServer/clientLib/Makefile \
-      keyValueServer/proxy/Makefile \
-      keyValueServer/server/Makefile \
-      tools/Makefile \
-      rcs_convert/Makefile \
-	  cvsapi/Makefile \
-	  cvsapi/db/Makefile \
-	  cvsapi/mdns/Makefile \
-	  cvstools/Makefile \
-	  xdiff/Makefile \
-	  mdnsclient/Makefile \
-	  run_script/Makefile \
-	  redhat/cvsnt.spec \
+AC_CONFIG_FILES([Makefile
+	  diff/Makefile
+	  lib/Makefile
+	  cvsgui/Makefile
+	  cvsdelta/Makefile
+	  man/Makefile
+	  src/Makefile
+	  protocols/Makefile
+	  triggers/Makefile
+	  lockservice/Makefile
+	  rcs/Makefile
+      blake3/Makefile
+      ca_blobs_fs/Makefile
+      keyValueServer/blob_sockets/Makefile
+      keyValueServer/clientLib/Makefile
+      keyValueServer/proxy/Makefile
+      keyValueServer/server/Makefile
+      tools/Makefile
+      rcs_convert/Makefile
+	  cvsapi/Makefile
+	  cvsapi/db/Makefile
+	  cvsapi/mdns/Makefile
+	  cvstools/Makefile
+	  xdiff/Makefile
+	  mdnsclient/Makefile
+	  run_script/Makefile
+	  redhat/cvsnt.spec
 	  osx/Makefile])
 AC_OUTPUT

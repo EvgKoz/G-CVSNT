@@ -28,3 +28,9 @@ tmp/*.*
 CVS
 log1
 log2
+# Linux client build (build-linux-client)
+cvsnt/.deps-linux/
+cvsnt/dist-linux/
+config.log
+config.status
+stamp-h1

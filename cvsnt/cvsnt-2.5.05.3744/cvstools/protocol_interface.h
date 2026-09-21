@@ -115,7 +115,7 @@ enum
 	CVSPROTO_SUCCESS_NOPROTOCOL = -6, /* Connect succeeded, don't wait for 'I LOVE YOU' response */
 };
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__linux__)
 #ifdef MODULE
 /* This needs an extra level of indirection.  gcc bug? */
 #define __x11432a(__mod,__func) __mod##_protocol_LTX_##__func
