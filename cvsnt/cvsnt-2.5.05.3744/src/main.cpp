@@ -348,6 +348,7 @@ static const char *const opt_usage[] =
 	"\n",
     "    --blob_url url   Blob download|upload url, each url can be in form of 127.0.0.1/something@80 (@80 - means port). 'def' means master. (examples: http://cvs-proxy.lan@8080 or localhost@2403|cvs-master.lan@2403)\n",
     "    --blob_progress Once a second print current blob download speed and the server(s) data comes from.\n",
+    "    --blob_expected_speed MB/s  While total blob download speed is below this, keep switching the slowest download source to another one (retrying failed ones too).\n",
     "    --version       CVS version and copyright.\n",
     "    --encrypt       Encrypt all net traffic (if supported by protocol).\n",
     "    --authenticate  Authenticate all net traffic (if supported by protocol).\n",
@@ -761,6 +762,7 @@ int main (int argc, char **argv)
 #endif
     	{"blob_url", required_argument, NULL, 11},
     	{"blob_progress", 0, NULL, 12},
+    	{"blob_expected_speed", required_argument, NULL, 13},
         {0, 0, 0, 0}
     };
     /* `getopt_long' stores the option index here, but right now we
@@ -1020,6 +1022,11 @@ int main (int argc, char **argv)
 		break;
         case 12:
         blob_download_progress = 1;
+		break;
+        case 13:
+        blob_expected_download_speed = atof(optarg) * 1024. * 1024.;
+        if (blob_expected_download_speed <= 0.)
+          error (1, 0, "expected blob download speed must be a positive number of MB/s");
 		break;
 	    case 's':
 		variable_set (optarg);

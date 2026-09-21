@@ -8,6 +8,10 @@
 
 void error(int, int, const char*, ...);
 
+const char *blob_slow_switch_err = "source is slow, switching";//recognized by the retry loop
+//set while we deliberately close a socket to abort a pull: suppresses the resulting read-error logs
+static thread_local bool expect_socket_abort = false;
+
 inline KVRet send_blob_file_data_net(BlobSocket &client, const char *file, const char *hash, bool blob_binary_compressed, std::string &err)
 {
   auto output = std::stringstream("");
@@ -81,27 +85,51 @@ struct KVNetworkProcessor:public BlobNetworkProcessor
   ~KVNetworkProcessor() { stop_blob_push_client(client); }
 
   bool start() {return is_valid(client) ? true : init(); }
+  bool connectTo(const char *url, int port)
+  {
+    uint8_t otp[otp_page_size]; uint64_t otp_page = 0;
+    const bool has_otp = provider.getOTP(otp, sizeof(otp), otp_page);
+    CafsClientAuthentication auth = provider.demandAuth() ? CafsClientAuthentication::RequiresAuth : CafsClientAuthentication::AllowNoAuthPrivate;
+    stop_blob_push_client(client);
+    if (is_valid(client = start_blob_push_client(url, port, provider.getRoot(), 2/*timeout*/, has_otp ? otp : nullptr, otp_page, auth)))
+    {
+      //escalate patience with every consecutive failure: a huge blob served over a genuinely slow
+      //path can pause longer than the default timeout, and it must still be able to complete
+      blob_send_recieve_sock_timeout(client, 30 * (1 << (failStreak > 3 ? 3 : failStreak)));
+      extern void blob_progress_note_server(int id, const char *url, int port);
+      blob_progress_note_server(id, url, port);//ignores upload clients (id < 0)
+      return true;
+    }
+    return false;
+  }
   bool attemptReconnect(int attemptNo)
   {
     if (attemptNo >= provider.attemptsCount(id))
       return false;
-    uint8_t otp[otp_page_size]; uint64_t otp_page = 0;
-    const bool has_otp = provider.getOTP(otp, sizeof(otp), otp_page);
     std::string url; int port;
     if (!provider.getNext(attemptNo, id, url, port))
       return false;
-    CafsClientAuthentication auth = provider.demandAuth() ? CafsClientAuthentication::RequiresAuth : CafsClientAuthentication::AllowNoAuthPrivate;
-    stop_blob_push_client(client);
-    if (is_valid(client = start_blob_push_client(url.c_str(), port, provider.getRoot(), 2/*timeout*/, has_otp ? otp : nullptr, otp_page, auth)))
-    {
-      extern void blob_progress_note_server(int id, const char *url, int port);
-      blob_progress_note_server(id, url.c_str(), port);//ignores upload clients (id < 0)
+    if (connectTo(url.c_str(), port))
       return true;
-    }
     provider.fail(attemptNo, id);
     return false;
   }
-  bool reconnect() { ++attempt;  return init(); }
+  //error recovery reconnects round robin - the next source is guaranteed to be a different one
+  //(the current source's measured speed is stale at best, it just failed us). only a supervisor
+  //requested switch prefers the fastest source measured so far
+  bool reconnect() { return reconnectEx(false); }
+  bool reconnectEx(bool preferFastest)
+  {
+    if (preferFastest)
+    {
+      extern bool blob_progress_pick_fastest(int id, std::string &url, int &port);
+      std::string url; int port;
+      if (blob_progress_pick_fastest(id, url, port) && connectTo(url.c_str(), port))
+        return true;
+    }
+    ++attempt;
+    return init();
+  }
   bool init() {
     //wrap around the source list, so a client is never permanently out of sources
     //(also retries sources that failed earlier - the network could have recovered)
@@ -119,19 +147,39 @@ struct KVNetworkProcessor:public BlobNetworkProcessor
   }
   virtual bool canDownload() {return true;}
   virtual bool canUpload() {return true;}
-  virtual bool download(const char *hex_hash, std::function<bool(const char *data, size_t data_length)> cb, std::string &err)
+  virtual bool download(const char *hex_hash, std::function<bool(const char *data, size_t data_length)> cb, std::string &err, bool allow_midpull_switch)
   {
-    start();
-    bool ok = true;
     extern void blob_progress_add_bytes(int id, uint64_t sz);
+    extern bool blob_progress_should_switch(int id);
+    extern void blob_progress_penalize_source(int id);
+    if (blob_progress_should_switch(id))
+      reconnectEx(true);//we are on a slow source: prefer the fastest known one
+    else
+      start();
+    bool ok = true, switching = false;
     int64_t pulled = blob_pull_from_server(client, HASH_TYPE_REV_STRING, hex_hash, 0, 0, [&](const char *data, uint64_t , uint64_t size)
     {
        if (data && ok)//that's hint of size
        {
          blob_progress_add_bytes(id, size);
-         ok = cb(data, size);
+         //abort mid-blob too, or one huge blob would pin us to the slow source till the end.
+         //the pull protocol can only be aborted by closing the socket
+         if (allow_midpull_switch && !switching && blob_progress_should_switch(id))
+         {
+           switching = true; ok = false;
+           expect_socket_abort = true;//the read errors that follow are intended, don't report them
+           stop_blob_push_client(client);
+         }
+         else
+           ok = cb(data, size);
        }
     });
+    if (switching)
+    {
+      expect_socket_abort = false;
+      err = blob_slow_switch_err;//caller reconnects (to the next source) and retries
+      return false;
+    }
     if (pulled == 0)
     {
       err = "No blob ";
@@ -142,7 +190,9 @@ struct KVNetworkProcessor:public BlobNetworkProcessor
     {
       err = "Error reading data ";
       err += hex_hash;
-      init();
+      ++failStreak;
+      blob_progress_penalize_source(id);//don't let a stale speed record keep sending us back here
+      //no reconnect here - the caller does it (round robin, to a different source)
       return false;
     }
     if (!ok)
@@ -151,6 +201,7 @@ struct KVNetworkProcessor:public BlobNetworkProcessor
       err += hex_hash;
       return false;
     }
+    failStreak = 0;
     return true;
   }
   virtual bool upload(const char *file, bool compress, char *hex_hash, std::string &err) {
@@ -174,6 +225,7 @@ struct KVNetworkProcessor:public BlobNetworkProcessor
   BlobSocket client;
   const UrlProvider& provider;
   int id = 0, attempt = 0;
+  int failStreak = 0;//consecutive failed pulls: escalates the socket timeout
 };
 
 BlobNetworkProcessor *get_kv_processor(const UrlProvider& provider_, int id)
@@ -185,8 +237,10 @@ BlobNetworkProcessor *get_kv_processor(const UrlProvider& provider_, int id)
 #include <stdarg.h>
 void blob_logmessage(int log, const char *fmt,...)
 {
-  if (log < LOG_WARNING)
+  if (log < LOG_WARNING || expect_socket_abort)
     return;
+  extern void blob_progress_clear_line();
+  blob_progress_clear_line();//don't append to the progress line
   char buf[512];
   va_list va;
   va_start(va, fmt);

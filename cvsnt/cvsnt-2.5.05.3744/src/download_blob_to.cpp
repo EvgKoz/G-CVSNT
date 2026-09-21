@@ -45,28 +45,89 @@ int blob_download_progress = 0;//--blob_progress: once a second print download s
 enum {MAX_PROGRESS_CLIENTS = 64};
 static std::atomic<uint64_t> progress_bytes{0};//total wire bytes downloaded
 static std::atomic<uint64_t> progress_client_bytes[MAX_PROGRESS_CLIENTS];
+static std::atomic<bool> switch_request[MAX_PROGRESS_CLIENTS];//supervisor asks a client to move to another source
+static std::atomic<int> progress_total_clients{1};//how many download clients were created
 static std::atomic<bool> progress_stop{false};
 static std::thread progress_thread;
 static std::mutex progress_mutex;//guards urls & console line state
 static std::string progress_client_url[MAX_PROGRESS_CLIENTS];//url:port each download client is connected to
 static size_t progress_line_len = 0;//chars of progress line currently on screen
 
+struct SourceSpeed { std::string key/*url:port*/, url; int port; double ewma/*bytes per sec, <=0 - unmeasured*/; double last/*this tick, 0 - inactive*/; };
+static std::vector<SourceSpeed> source_speeds;//guarded by progress_mutex
+
+//slow-source supervision: while the total download speed stays below the expected speed given
+//via --blob_expected_speed, the slowest client is asked to switch to another source once every
+//SLOW_TICKS seconds (source selection wraps around, so previously failed sources are retried too)
+enum {SLOW_TICKS = 3};
+double blob_expected_download_speed = 0.;//bytes/sec, 0 = supervision off
+
 void blob_progress_note_server(int id, const char *url, int port)
 {
-  if (!blob_download_progress || unsigned(id) >= MAX_PROGRESS_CLIENTS)
+  if (unsigned(id) >= MAX_PROGRESS_CLIENTS)
     return;
   char buf[300]; std::snprintf(buf, sizeof(buf), "%s:%d", url, port);
   std::lock_guard<std::mutex> lock(progress_mutex);
   progress_client_url[id] = buf;
+  for (auto &s : source_speeds)
+    if (s.key == buf)
+      return;
+  source_speeds.push_back(SourceSpeed{buf, url, port, 0., 0.});
+}
+
+//a pull from this client's source failed: its measured speed is history now, stop treating it as
+//the fastest until it proves itself again
+void blob_progress_penalize_source(int id)
+{
+  if (unsigned(id) >= MAX_PROGRESS_CLIENTS)
+    return;
+  std::lock_guard<std::mutex> lock(progress_mutex);
+  for (auto &s : source_speeds)
+    if (s.key == progress_client_url[id])
+    {
+      s.ewma *= 0.5;
+      return;
+    }
+}
+
+//the fastest source we have measured so far, if it is meaningfully faster than what the client is on.
+//false means: nothing clearly better is known, explore round robin instead
+bool blob_progress_pick_fastest(int id, std::string &url, int &port)
+{
+  if (unsigned(id) >= MAX_PROGRESS_CLIENTS)
+    return false;
+  std::lock_guard<std::mutex> lock(progress_mutex);
+  const std::string &cur = progress_client_url[id];
+  double curSpd = 0.;
+  const SourceSpeed *best = nullptr;
+  for (const auto &s : source_speeds)
+  {
+    if (s.key == cur)
+      curSpd = s.ewma;
+    else if (s.ewma > 0. && (!best || s.ewma > best->ewma))
+      best = &s;
+  }
+  if (!best || best->ewma <= curSpd*1.5)
+    return false;
+  url = best->url;
+  port = best->port;
+  return true;
 }
 
 void blob_progress_add_bytes(int id, uint64_t sz)
 {
-  if (!blob_download_progress)
-    return;
   progress_bytes.fetch_add(sz, std::memory_order_relaxed);
   if (unsigned(id) < MAX_PROGRESS_CLIENTS)
     progress_client_bytes[id].fetch_add(sz, std::memory_order_relaxed);
+}
+
+//test-and-clear: the client either reconnects right away (between blobs) or aborts the
+//current pull so the retry loop reconnects it
+bool blob_progress_should_switch(int id)
+{
+  if (unsigned(id) >= MAX_PROGRESS_CLIENTS)
+    return false;
+  return switch_request[id].exchange(false, std::memory_order_relaxed);
 }
 
 static void progress_clear_line_unlocked()
@@ -92,7 +153,7 @@ static void progress_loop()
 {
   const double MB = 1024.*1024.;
   uint64_t prev = 0, prevClient[MAX_PROGRESS_CLIENTS] = {0};
-  bool printedAnything = false;
+  int slowStreak = 0, zeroTicks = 0;
   auto tick = std::chrono::steady_clock::now();
   for (;;)
   {
@@ -106,28 +167,87 @@ static void progress_loop()
     prev = cur;
     if (!cur)
       continue;//nothing downloaded yet, keep quiet
-    //the source to show is where the bytes of the last second actually came from
-    int best = -1, active = 0; uint64_t bestSpd = 0;
+    uint64_t delta[MAX_PROGRESS_CLIENTS];
+    int worst = -1, active = 0; uint64_t bestSpd = 0, worstSpd = ~uint64_t(0);
     for (int i = 0; i < MAX_PROGRESS_CLIENTS; ++i)
     {
-      const uint64_t cb = progress_client_bytes[i].load(std::memory_order_relaxed), d = cb - prevClient[i];
+      const uint64_t cb = progress_client_bytes[i].load(std::memory_order_relaxed);
+      delta[i] = cb - prevClient[i];
       prevClient[i] = cb;
-      if (!d)
+      if (!delta[i])
         continue;
       ++active;
-      if (d > bestSpd) { bestSpd = d; best = i; }
+      if (delta[i] > bestSpd) bestSpd = delta[i];
+      if (delta[i] < worstSpd) { worstSpd = delta[i]; worst = i; }
     }
-    char line[512], more[32] = "";
-    if (active > 1)
-      std::snprintf(more, sizeof(more), " +%d more", active-1);
+
     std::lock_guard<std::mutex> lock(progress_mutex);
-    std::snprintf(line, sizeof(line), "%.2f MB/s from %s%s (%.1f MB total)",
-      spd/MB, best < 0 ? "-" : progress_client_url[best].c_str(), more, cur/MB);
+
+    //update observed per-source speeds (per-connection: the best client on that source this tick)
+    for (auto &s : source_speeds)
+    {
+      uint64_t bestOn = 0;
+      for (int i = 0; i < MAX_PROGRESS_CLIENTS; ++i)
+        if (delta[i] && s.key == progress_client_url[i])
+          bestOn = std::max(bestOn, delta[i]);
+      s.last = double(bestOn);
+      if (bestOn)
+        s.ewma = s.ewma <= 0. ? double(bestOn) : s.ewma*0.7 + double(bestOn)*0.3;
+    }
+
+    const SourceSpeed *fastest = nullptr;
+    for (const auto &s : source_speeds)
+      if (s.ewma > 0. && (!fastest || s.ewma > fastest->ewma))
+        fastest = &s;
+
+    //supervision: rotate the slowest client only while the total speed is below expected AND no
+    //client meets its fair share of it AND a visibly better source is actually known. once at least
+    //one client sits on a fast source, slow ones are left running - they still add bandwidth in
+    //parallel; and when every known source is equally slow, switching would only lose progress.
+    //(the fair-share guard also protects the tail of a checkout: one remaining client is
+    //inevitably below the total expectation)
+    if (blob_expected_download_speed > 0. && active)
+    {
+      const double perClient = blob_expected_download_speed / std::max(1, progress_total_clients.load());
+      const bool betterExists = fastest && worst >= 0 && fastest->key != progress_client_url[worst]
+        && fastest->ewma > double(worstSpd)*1.5;
+      const bool rotate = double(spd) < blob_expected_download_speed && betterExists && double(bestSpd) < perClient;
+      slowStreak = rotate ? slowStreak+1 : 0;
+      if (slowStreak >= SLOW_TICKS)
+      {
+        slowStreak = 0;
+        switch_request[worst].store(true, std::memory_order_relaxed);
+        if (blob_download_progress)
+        {
+          progress_clear_line_unlocked();
+          fprintf(stderr, "%.2f MB/s is below expected %.2f MB/s and no source is fast: switching slowest %s (%.2f MB/s)\n",
+            spd/MB, blob_expected_download_speed/MB, progress_client_url[worst].c_str(), worstSpd/MB);
+        }
+      }
+    }
+
+    if (!blob_download_progress)
+      continue;
+    //when nothing is being downloaded for a while, erase the line and stay quiet instead of
+    //keeping an idle "0.00 MB/s" line other output would glue onto
+    zeroTicks = spd ? 0 : zeroTicks+1;
+    if (zeroTicks >= 3)
+    {
+      progress_clear_line_unlocked();
+      continue;
+    }
+    //show how many sources feed us and which known source is the fastest
+    char line[512], srcs[400];
+    if (fastest)//realtime speed while it is active, its remembered maximum otherwise
+      std::snprintf(srcs, sizeof(srcs), "%d source%s, fastest %s %s%.2f MB/s", active, active == 1 ? "" : "s",
+        fastest->key.c_str(), fastest->last > 0. ? "" : "max ", (fastest->last > 0. ? fastest->last : fastest->ewma)/MB);
+    else
+      std::snprintf(srcs, sizeof(srcs), "%d source%s", active, active == 1 ? "" : "s");
+    std::snprintf(line, sizeof(line), "%.2f MB/s from %s (%.1f MB total)", spd/MB, srcs, cur/MB);
     const size_t len = strlen(line);
     fprintf(stderr, "\r%-*s", (int)(len > progress_line_len ? len : progress_line_len), line);
     fflush(stderr);
     progress_line_len = len;
-    printedAnything = true;
   }
   std::lock_guard<std::mutex> lock(progress_mutex);
   if (progress_line_len)
@@ -136,13 +256,11 @@ static void progress_loop()
     fflush(stderr);
     progress_line_len = 0;
   }
-  else if (printedAnything)
-    fflush(stderr);
 }
 
 static void start_progress_thread()
 {
-  if (!blob_download_progress || progress_thread.joinable())
+  if ((!blob_download_progress && blob_expected_download_speed <= 0.) || progress_thread.joinable())
     return;
   progress_stop = false;
   progress_thread = std::thread(progress_loop);
@@ -406,6 +524,7 @@ void BackgroundProcessor::init()
   roundRobin.urls.push_back(DownloadURL{master_url, master_port});//the last one
 
   const uint32_t clientsCount = (uint32_t)std::max(1, threads_count);
+  progress_total_clients = (int)clientsCount;
   roundRobin.createShuffles(clientsCount, publicUrlsCnt, privateUrlsCnt);
 
   download_clients.resize(clientsCount);
@@ -508,9 +627,19 @@ static bool download_blob_ref_file(BlobNetworkProcessor *processor, const BlobTa
   std::string temp_filename = task.dirpath +"/_new_";
   temp_filename += task.filename;
   size_t readUncompressedSz = ~size_t(0);
+  extern const char *blob_slow_switch_err;
+  bool wasSwitch = false;
   for (int i = 0; i < 16; ++i)//make 16 attempts
   {
-
+    if (i)
+    {
+      if (hasErrors.load())//another thread already failed the batch, don't keep retrying
+        return false;
+      //give the network a chance to recover before retrying (each attempt walks the whole source
+      //list). a supervisor-requested switch is not a network problem - retry immediately
+      if (!wasSwitch)
+        std::this_thread::sleep_for(std::chrono::seconds(std::min(i, 5)));
+    }
     FILE* tmp = fopen(temp_filename.c_str(), "wb");
     if (!tmp)
     {
@@ -534,7 +663,8 @@ static bool download_blob_ref_file(BlobNetworkProcessor *processor, const BlobTa
               return written == sz;
             });//we can easily add hash validation here. but seems unnessasry
         },
-        err);
+        err, i == 0/*a retry must complete, not get aborted by the supervisor again*/);
+    wasSwitch = !downloadRet && err == blob_slow_switch_err;
     if (tmp && fclose(tmp) != 0)
     {
       err += "\nCan't write file - disk is full?";
@@ -579,7 +709,7 @@ static bool download_blob_ref_file(BlobNetworkProcessor *processor, const BlobTa
       {
         err_msg(buf);
         return false;
-      } else
+      } else if (!wasSwitch)//supervisor-requested switches are already announced, keep them quiet here
       {
         blob_progress_clear_line();
         error(0,0, "%s Reconnecting!\n", buf);

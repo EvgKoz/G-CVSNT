@@ -10,7 +10,9 @@ struct BlobNetworkProcessor
   virtual bool reconnect() = 0;
   virtual bool canDownload() = 0;
   virtual bool canUpload() = 0;
-  virtual bool download(const char *hex_hash, std::function<bool(const char *data, size_t data_length)>, std::string &err) = 0;
+  //allow_midpull_switch permits aborting the transfer mid-blob to switch to a faster source;
+  //the caller has to pass false on retries so a download always completes eventually
+  virtual bool download(const char *hex_hash, std::function<bool(const char *data, size_t data_length)>, std::string &err, bool allow_midpull_switch = true) = 0;
   virtual bool upload(const char *file, bool compress, char *hex_hash, std::string &err) = 0;
 };
 

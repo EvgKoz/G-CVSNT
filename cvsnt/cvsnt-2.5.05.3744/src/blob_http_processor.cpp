@@ -8,7 +8,7 @@ struct HttpNetworkProcessor:public BlobNetworkProcessor
   bool reconnect() override {return false;}
   bool canDownload() override {return true;}
   bool canUpload() override {return false;}
-  bool download(const char *hex_hash, std::function<bool(const char *data, size_t data_length)> cb, std::string &err)
+  bool download(const char *hex_hash, std::function<bool(const char *data, size_t data_length)> cb, std::string &err, bool/*allow_midpull_switch: http transfers are not abortable anyway*/)
   {
     char buf[128];
     std::snprintf(buf, sizeof(buf),

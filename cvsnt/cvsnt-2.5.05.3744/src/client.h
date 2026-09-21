@@ -11,6 +11,7 @@ extern int file_gzip_level;
 extern int blob_concurrency_download_level;
 extern char blob_cmd_download_url[256];
 extern int blob_download_progress;
+extern double blob_expected_download_speed;
 
 /* Whether the connection should be encrypted.  */
 extern int cvsencrypt;
