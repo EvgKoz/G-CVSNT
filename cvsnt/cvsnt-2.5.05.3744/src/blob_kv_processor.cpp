@@ -103,9 +103,18 @@ struct KVNetworkProcessor:public BlobNetworkProcessor
   }
   bool reconnect() { ++attempt;  return init(); }
   bool init() {
-    for (int e = provider.attemptsCount(id); attempt < e; ++attempt)
-      if (attemptReconnect(attempt))
+    //wrap around the source list, so a client is never permanently out of sources
+    //(also retries sources that failed earlier - the network could have recovered)
+    const int e = provider.attemptsCount(id);
+    if (e <= 0)
+      return false;
+    for (int i = 0; i < e; ++i)
+      if (attemptReconnect((attempt + i) % e))
+      {
+        attempt = (attempt + i) % e;
         return true;
+      }
+    attempt %= e;
     return false;
   }
   virtual bool canDownload() {return true;}
