@@ -53,8 +53,18 @@ static std::mutex progress_mutex;//guards urls & console line state
 static std::string progress_client_url[MAX_PROGRESS_CLIENTS];//url:port each download client is connected to
 static size_t progress_line_len = 0;//chars of progress line currently on screen
 
-struct SourceSpeed { std::string key/*url:port*/, url; int port; double ewma/*bytes per sec, <=0 - unmeasured*/; double last/*this tick, 0 - inactive*/; };
+struct SourceSpeed
+{
+  std::string key/*url:port*/, url; int port;
+  double ewma/*per-connection bytes per sec, <=0 - unmeasured*/;
+  double last/*this tick, 0 - inactive*/;
+  uint64_t bytes = 0;//total downloaded from this source
+  uint32_t ticks = 0;//seconds it was actively serving us
+  double peak = 0.;//peak source throughput, bytes per sec
+};
 static std::vector<SourceSpeed> source_speeds;//guarded by progress_mutex
+static uint32_t total_active_ticks = 0;//seconds anything was downloading, guarded by progress_mutex
+static uint64_t summary_reported = 0;//bytes already covered by a printed summary
 
 //slow-source supervision: while the total download speed stays below the expected speed given
 //via --blob_expected_speed, the slowest client is asked to switch to another source once every
@@ -183,17 +193,28 @@ static void progress_loop()
 
     std::lock_guard<std::mutex> lock(progress_mutex);
 
-    //update observed per-source speeds (per-connection: the best client on that source this tick)
+    //update observed per-source speeds (selection uses per-connection speed: the best client on
+    //that source this tick; statistics use the summed source throughput)
     for (auto &s : source_speeds)
     {
-      uint64_t bestOn = 0;
+      uint64_t bestOn = 0, sumOn = 0;
       for (int i = 0; i < MAX_PROGRESS_CLIENTS; ++i)
         if (delta[i] && s.key == progress_client_url[i])
+        {
+          sumOn += delta[i];
           bestOn = std::max(bestOn, delta[i]);
+        }
       s.last = double(bestOn);
-      if (bestOn)
+      if (sumOn)
+      {
+        s.bytes += sumOn;
+        ++s.ticks;
+        s.peak = std::max(s.peak, double(sumOn));
         s.ewma = s.ewma <= 0. ? double(bestOn) : s.ewma*0.7 + double(bestOn)*0.3;
+      }
     }
+    if (spd)
+      ++total_active_ticks;
 
     const SourceSpeed *fastest = nullptr;
     for (const auto &s : source_speeds)
@@ -250,11 +271,19 @@ static void progress_loop()
     progress_line_len = len;
   }
   std::lock_guard<std::mutex> lock(progress_mutex);
-  if (progress_line_len)
+  progress_clear_line_unlocked();
+  //final statistics: what was downloaded, how fast, and from whom
+  const uint64_t total = progress_bytes.load();
+  if (blob_download_progress && total > summary_reported)
   {
-    fputs("\n", stderr);
+    summary_reported = total;
+    fprintf(stderr, "blobs: %.1f MB downloaded in %us, avg %.2f MB/s\n",
+      total/MB, total_active_ticks, total_active_ticks ? total/MB/total_active_ticks : total/MB);
+    for (const auto &s : source_speeds)
+      if (s.bytes)
+        fprintf(stderr, "  %s: %.1f MB, avg %.2f MB/s, peak %.2f MB/s\n",
+          s.key.c_str(), s.bytes/MB, s.bytes/MB/s.ticks, s.peak/MB);
     fflush(stderr);
-    progress_line_len = 0;
   }
 }
 
